@@ -1,0 +1,10 @@
+venv/
+data/
+runs/
+__pycache__/
+*.zip
+*.pt
+yolov8s.pt
+yolo26n.pt
+*.cache
+!models/best.pt
