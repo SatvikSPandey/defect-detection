@@ -53,19 +53,53 @@ Crazing is the hardest class — fine surface cracks with subtle visual texture 
 Input Image
 │
 ▼
-YOLOv8s (fine-tuned)
-│
+┌─────────────────────────────┐
+│     Inference Mode Toggle   │
+└─────────────────────────────┘
+│                    │
+▼                    ▼
+YOLOv8 Native        ONNX Runtime
+(PyTorch)            (Edge/CPU)
+│                    │
+└────────┬───────────┘
 ▼
-Bounding Boxes + Class Labels + Confidence Scores
+Bounding Boxes + Labels + Confidence
 │
-├──▶ Annotated Image Display
-├──▶ Detection Summary (per-class count + confidence)
-├──▶ PNG Download
-└──▶ PDF Quality Control Report
+┌────────┼────────────┐
+▼        ▼            ▼
+Annotated  Detection   PDF QC
+Image     Summary     Report
 
 **Why YOLOv8:** Single-stage detector — one forward pass produces all bounding boxes simultaneously. Faster than two-stage detectors (e.g. Faster R-CNN), suitable for real-time manufacturing inspection pipelines.
 
 **Why transfer learning:** YOLOv8s pretrained on COCO already understands edges, textures, and shapes. Fine-tuning on domain-specific defect images converges faster and achieves higher accuracy than training from scratch.
+
+**Why ONNX export:** ONNX (Open Neural Network Exchange) is a universal model format that decouples the model from the training framework. Once exported, the model runs via ONNX Runtime without PyTorch installed — enabling deployment on edge devices, ARM hardware, factory floor cameras, and embedded systems without GPU dependency.
+
+---
+
+## Inference Modes
+
+| Mode | Engine | GPU Required | Use Case |
+|---|---|---|---|
+| YOLOv8 Native | PyTorch | Optional | Development, cloud |
+| ONNX Runtime | onnxruntime | No | Edge devices, CPU-only hardware |
+
+### ONNX Export Process
+
+```bash
+from ultralytics import YOLO
+model = YOLO('models/best.pt')
+model.export(format='onnx', imgsz=640)
+# Output: models/best.onnx (~42MB)
+```
+
+The exported ONNX model runs a manual inference pipeline:
+1. Resize input to 640×640, normalize to [0,1]
+2. Run ONNX Runtime session
+3. Parse raw output tensor (1, 10, 8400) — 8400 anchor boxes
+4. Filter by confidence threshold
+5. Apply NMS (Non-Maximum Suppression) via OpenCV to remove duplicate boxes
 
 ---
 
@@ -77,6 +111,7 @@ Bounding Boxes + Class Labels + Confidence Scores
 - **Frontend:** Streamlit
 - **Image processing:** OpenCV, Pillow
 - **Report generation:** ReportLab (PDF)
+- **Edge inference:** ONNX Runtime
 - **Deployment:** Streamlit Cloud
 
 ---
@@ -100,7 +135,8 @@ defect-detection/
 ├── app.py                  # Streamlit app (inference + PDF report)
 ├── train.py                # Training script (local GPU)
 ├── models/
-│   └── best.pt             # Fine-tuned YOLOv8s weights
+│   ├── best.pt             # Fine-tuned YOLOv8s weights (PyTorch)
+│   └── best.onnx           # Exported ONNX model (edge inference)
 ├── requirements.txt
 ├── packages.txt            # Streamlit Cloud system dependencies
 └── README.md
@@ -109,7 +145,7 @@ defect-detection/
 
 ## Sample Output
 
-Upload any steel surface image and the model will detect defects, draw labelled bounding boxes, and generate a PDF quality control report showing defect class, count, and confidence scores — mirroring what a real manufacturing inspection system would produce.
+Upload any steel surface image and the model will detect defects, draw labelled bounding boxes, and generate a PDF quality control report showing defect class, count, and confidence scores — mirroring what a real manufacturing inspection system would produce. Switch between YOLOv8 Native and ONNX Runtime inference modes to compare outputs.
 
 ---
 
@@ -120,3 +156,4 @@ Dataset: [NEU Steel Surface Defect Dataset](https://universe.roboflow.com/neudat
 ---
 
 *Built by [Satvik Pandey](https://github.com/SatvikSPandey)*
+
