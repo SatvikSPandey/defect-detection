@@ -12,8 +12,20 @@ from reportlab.lib.units import cm
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image as RLImage
 from reportlab.lib.styles import getSampleStyleSheet
 import io
+import onnxruntime as ort
 
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "best.pt")
+MODEL_PT_PATH = os.path.join(os.path.dirname(__file__), "models", "best.pt")
+MODEL_ONNX_PATH = os.path.join(os.path.dirname(__file__), "models", "best.onnx")
+
+CLASS_NAMES = ['crazing', 'inclusion', 'patches', 'pitted_surface', 'rolled-in_scale', 'scratches']
+COLORS = {
+    0: (255, 100, 100),
+    1: (100, 255, 100),
+    2: (100, 100, 255),
+    3: (255, 255, 100),
+    4: (255, 100, 255),
+    5: (100, 255, 255),
+}
 
 st.set_page_config(
     page_title="Industrial Defect Detection",
@@ -22,41 +34,84 @@ st.set_page_config(
 )
 
 @st.cache_resource
-def load_model():
-    return YOLO(MODEL_PATH)
+def load_yolo_model():
+    return YOLO(MODEL_PT_PATH)
 
-def run_inference(model, image_array, confidence):
-    results = model.predict(image_array, conf=confidence, verbose=False)
+@st.cache_resource
+def load_onnx_session():
+    return ort.InferenceSession(MODEL_ONNX_PATH, providers=["CPUExecutionProvider"])
+
+def run_yolo_inference(model, image_bgr, confidence):
+    results = model.predict(image_bgr, conf=confidence, verbose=False)
     return results[0]
 
-def draw_boxes(image_array, result):
-    annotated = image_array.copy()
-    class_names = result.names
-    colors_map = {
-        0: (255, 100, 100),
-        1: (100, 255, 100),
-        2: (100, 100, 255),
-        3: (255, 255, 100),
-        4: (255, 100, 255),
-        5: (100, 255, 255),
-    }
+def run_onnx_inference(session, image_bgr, confidence):
+    img = cv2.resize(image_bgr, (640, 640))
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img = img.astype(np.float32) / 255.0
+    img = np.transpose(img, (2, 0, 1))
+    img = np.expand_dims(img, axis=0)
+
+    input_name = session.get_inputs()[0].name
+    outputs = session.run(None, {input_name: img})
+    predictions = outputs[0][0]
+
+    orig_h, orig_w = image_bgr.shape[:2]
+    raw_boxes = []
+    for pred in predictions.T:
+        cx, cy, w, h = pred[0], pred[1], pred[2], pred[3]
+        class_scores = pred[4:]
+        cls_id = int(np.argmax(class_scores))
+        conf = float(class_scores[cls_id])
+        if conf < confidence:
+            continue
+        x1 = int((cx - w / 2) / 640 * orig_w)
+        y1 = int((cy - h / 2) / 640 * orig_h)
+        x2 = int((cx + w / 2) / 640 * orig_w)
+        y2 = int((cy + h / 2) / 640 * orig_h)
+        raw_boxes.append((x1, y1, x2, y2, cls_id, conf))
+
+    if not raw_boxes:
+        return []
+
+    np_boxes = np.array([[x1, y1, x2, y2] for (x1, y1, x2, y2, _, _) in raw_boxes], dtype=np.float32)
+    np_scores = np.array([conf for (_, _, _, _, _, conf) in raw_boxes], dtype=np.float32)
+    indices = cv2.dnn.NMSBoxes(np_boxes.tolist(), np_scores.tolist(), confidence, 0.45)
+
+    boxes = []
+    if len(indices) > 0:
+        for i in indices.flatten():
+            boxes.append(raw_boxes[i])
+    return boxes
+
+def draw_yolo_boxes(image_bgr, result):
+    annotated = image_bgr.copy()
     for box in result.boxes:
         cls_id = int(box.cls[0])
         conf = float(box.conf[0])
-        label = f"{class_names[cls_id]} {conf:.2f}"
+        label = f"{CLASS_NAMES[cls_id]} {conf:.2f}"
         x1, y1, x2, y2 = map(int, box.xyxy[0])
-        color = colors_map.get(cls_id, (255, 255, 255))
+        color = COLORS.get(cls_id, (255, 255, 255))
         cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
         cv2.putText(annotated, label, (x1, y1 - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
     return annotated
 
-def get_defect_summary(result):
+def draw_onnx_boxes(image_bgr, boxes):
+    annotated = image_bgr.copy()
+    for (x1, y1, x2, y2, cls_id, conf) in boxes:
+        label = f"{CLASS_NAMES[cls_id]} {conf:.2f}"
+        color = COLORS.get(cls_id, (255, 255, 255))
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(annotated, label, (x1, y1 - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+    return annotated
+
+def get_summary_from_yolo(result):
     summary = {}
-    class_names = result.names
     for box in result.boxes:
         cls_id = int(box.cls[0])
-        cls_name = class_names[cls_id]
+        cls_name = CLASS_NAMES[cls_id]
         conf = float(box.conf[0])
         if cls_name not in summary:
             summary[cls_name] = {"count": 0, "confidences": []}
@@ -64,7 +119,17 @@ def get_defect_summary(result):
         summary[cls_name]["confidences"].append(round(conf, 3))
     return summary
 
-def generate_pdf_report(summary, annotated_image_array, filename):
+def get_summary_from_onnx(boxes):
+    summary = {}
+    for (x1, y1, x2, y2, cls_id, conf) in boxes:
+        cls_name = CLASS_NAMES[cls_id]
+        if cls_name not in summary:
+            summary[cls_name] = {"count": 0, "confidences": []}
+        summary[cls_name]["count"] += 1
+        summary[cls_name]["confidences"].append(round(conf, 3))
+    return summary
+
+def generate_pdf_report(summary, annotated_image_array, filename, mode):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4,
                             rightMargin=2*cm, leftMargin=2*cm,
@@ -76,6 +141,7 @@ def generate_pdf_report(summary, annotated_image_array, filename):
     elements.append(Spacer(1, 0.4*cm))
     elements.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal']))
     elements.append(Paragraph(f"Source file: {filename}", styles['Normal']))
+    elements.append(Paragraph(f"Inference mode: {mode}", styles['Normal']))
     elements.append(Spacer(1, 0.6*cm))
 
     if not summary:
@@ -83,7 +149,6 @@ def generate_pdf_report(summary, annotated_image_array, filename):
     else:
         elements.append(Paragraph("Defect Summary", styles['Heading2']))
         elements.append(Spacer(1, 0.3*cm))
-
         table_data = [["Defect Class", "Count", "Avg Confidence", "Max Confidence"]]
         for cls_name, info in summary.items():
             avg_conf = round(sum(info["confidences"]) / len(info["confidences"]), 3)
@@ -107,7 +172,6 @@ def generate_pdf_report(summary, annotated_image_array, filename):
 
     elements.append(Paragraph("Annotated Image", styles['Heading2']))
     elements.append(Spacer(1, 0.3*cm))
-
     img_pil = Image.fromarray(cv2.cvtColor(annotated_image_array, cv2.COLOR_BGR2RGB))
     img_buffer = io.BytesIO()
     img_pil.save(img_buffer, format='PNG')
@@ -127,6 +191,12 @@ with st.sidebar:
     st.header("⚙️ Settings")
     confidence = st.slider("Confidence Threshold", 0.1, 0.95, 0.25, 0.05)
     st.markdown("---")
+    inference_mode = st.radio(
+        "Inference Mode",
+        ["YOLOv8 Native (PyTorch)", "ONNX Runtime (Edge)"],
+        help="YOLOv8 Native uses PyTorch. ONNX Runtime simulates edge deployment — no GPU required."
+    )
+    st.markdown("---")
     st.markdown("**Model:** YOLOv8s fine-tuned on NEU Steel Defect Dataset")
     st.markdown("**Classes:** crazing, inclusion, patches, pitted_surface, rolled-in_scale, scratches")
     st.markdown("**mAP50:** 77.6%")
@@ -134,14 +204,23 @@ with st.sidebar:
 uploaded_file = st.file_uploader("Upload an image", type=["jpg", "jpeg", "png", "bmp"])
 
 if uploaded_file:
-    model = load_model()
-
     file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
     image_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
     image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
 
-    result = run_inference(model, image_bgr, confidence)
-    annotated_bgr = draw_boxes(image_bgr, result)
+    if inference_mode == "YOLOv8 Native (PyTorch)":
+        model = load_yolo_model()
+        result = run_yolo_inference(model, image_bgr, confidence)
+        annotated_bgr = draw_yolo_boxes(image_bgr, result)
+        summary = get_summary_from_yolo(result)
+        mode_label = "YOLOv8 Native (PyTorch)"
+    else:
+        session = load_onnx_session()
+        boxes = run_onnx_inference(session, image_bgr, confidence)
+        annotated_bgr = draw_onnx_boxes(image_bgr, boxes)
+        summary = get_summary_from_onnx(boxes)
+        mode_label = "ONNX Runtime (Edge)"
+
     annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
 
     col1, col2 = st.columns(2)
@@ -149,10 +228,8 @@ if uploaded_file:
         st.subheader("Original Image")
         st.image(image_rgb, use_container_width=True)
     with col2:
-        st.subheader("Detected Defects")
+        st.subheader(f"Detected Defects ({mode_label})")
         st.image(annotated_rgb, use_container_width=True)
-
-    summary = get_defect_summary(result)
 
     st.subheader("📊 Detection Summary")
     if not summary:
@@ -182,7 +259,7 @@ if uploaded_file:
         )
 
     with col_pdf:
-        pdf_buffer = generate_pdf_report(summary, annotated_bgr, uploaded_file.name)
+        pdf_buffer = generate_pdf_report(summary, annotated_bgr, uploaded_file.name, mode_label)
         st.download_button(
             label="⬇️ Download PDF Report",
             data=pdf_buffer,
